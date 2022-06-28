@@ -3,8 +3,8 @@
 /**
  * @file PlagiarismPlugin.inc.php
  *
- * Copyright (c) 2003-2021 Simon Fraser University
- * Copyright (c) 2003-2021 John Willinsky
+ * Copyright (c) 2003-2020 Simon Fraser University
+ * Copyright (c) 2003-2020 John Willinsky
  * Distributed under the GNU GPL v3. For full terms see the file LICENSE.
  *
  * @brief Plagiarism plugin
@@ -20,8 +20,8 @@ class PlagiarismPlugin extends GenericPlugin {
 		$success = parent::register($category, $path, $mainContextId);
 		$this->addLocaleData();
 
-		if ($success && $this->getEnabled()) {
-			HookRegistry::register('submissionsubmitstep4form::execute', array($this, 'callback'));
+		if ($success && Config::getVar('ithenticate', 'ithenticate') && $this->getEnabled()) {
+			HookRegistry::register('submissionsubmitstep4form::display', array($this, 'callback'));
 		}
 		return $success;
 	}
@@ -37,67 +37,25 @@ class PlagiarismPlugin extends GenericPlugin {
 	 * @copydoc Plugin::getDescription()
 	 */
 	public function getDescription() {
-		return __('plugins.generic.plagiarism.description');
+		return Config::getVar('ithenticate', 'ithenticate')?__('plugins.generic.plagiarism.description'):__('plugins.generic.plagiarism.description.seeReadme');
 	}
 
 	/**
 	 * @copydoc LazyLoadPlugin::getCanEnable()
 	 */
-	function getCanEnable($contextId = null) {
-		return !Config::getVar('ithenticate', 'ithenticate');
-	}
-
-	/**
-	 * @copydoc LazyLoadPlugin::getCanDisable()
-	 */
-	function getCanDisable($contextId = null) {
-		return !Config::getVar('ithenticate', 'ithenticate');
+	function getCanEnable() {
+		if (!parent::getCanEnable()) return false;
+		return Config::getVar('ithenticate', 'ithenticate');
 	}
 
 	/**
 	 * @copydoc LazyLoadPlugin::getEnabled()
 	 */
 	function getEnabled($contextId = null) {
-		return parent::getEnabled($contextId) || Config::getVar('ithenticate', 'ithenticate');
+		if (!parent::getEnabled($contextId)) return false;
+		return Config::getVar('ithenticate', 'ithenticate');
 	}
 
-	/**
-	 * Fetch credentials from config.inc.php, if available
-	 * @return array username and password, or null(s)
-	**/
-	function getForcedCredentials() {
-		$request = Application::getRequest();
-		$context = $request->getContext();
-		$contextPath = $context->getPath();
-		$username = Config::getVar('ithenticate', 'username[' . $contextPath . ']',
-				Config::getVar('ithenticate', 'username'));
-		$password = Config::getVar('ithenticate', 'password[' . $contextPath . ']',
-				Config::getVar('ithenticate', 'password'));
-		return array($username, $password);
-	}
-
-	/**
-	 * Send the editor an error message
-	 * @param $submissionid int
-	 * @param $message string
-	 * @return void
-	**/
-	public function sendErrorMessage($submissionid, $message) {
-		$request = Application::getRequest();
-		$context = $request->getContext();
-		import('classes.notification.NotificationManager');
-		$notificationManager = new NotificationManager();
-		$roleDao = DAORegistry::getDAO('RoleDAO'); /* @var $roleDao RoleDAO */
-		// Get the managers.
-		$managers = $roleDao->getUsersByRoleId(ROLE_ID_MANAGER, $context->getId());
-		$managersArray = $managers->toAssociativeArray();
-		$allUserIds = array_keys($managersArray);
-		foreach ($allUserIds as $userId) {
-			$notificationManager->createTrivialNotification($userId, NOTIFICATION_TYPE_ERROR, array('contents' => __('plugins.generic.plagiarism.errorMessage', array('submissionId' => $submissionid, 'errorMessage' => $message))));
-		}
-		error_log('iThenticate submission '.$submissionid.' failed: '.$message);
-	}
-	
 	/**
 	 * Send submission files to iThenticate.
 	 * @param $hookName string
@@ -106,38 +64,60 @@ class PlagiarismPlugin extends GenericPlugin {
 	public function callback($hookName, $args) {
 		$request = Application::getRequest();
 		$context = $request->getContext();
-		$contextPath = $context->getPath();
-		$submissionDao = DAORegistry::getDAO('SubmissionDAO'); /* @var $submissionDao SubmissionDAO */
+		$submissionDao = Application::getSubmissionDAO();
 		$submission = $submissionDao->getById($request->getUserVar('submissionId'));
 		$publication = $submission->getCurrentPublication();
+		$journal = & $request->getJournal();
+	        $journalId = $journal->getId();
 
 		require_once(dirname(__FILE__) . '/vendor/autoload.php');
 
-		// try to get credentials for current context otherwise use default config
-        	$contextId = $context->getId();
-		$credentials = $this->getForcedCredentials(); 
-		$username = $credentials[0];
-		$password = $credentials[1];
-		if (empty($username) || empty($password)) {
-			$username = $this->getSetting($contextId, 'ithenticate_user');
-			$password = $this->getSetting($contextId, 'ithenticate_pass');
+		$proxyName = Config::getVar('proxy', 'http_host');
+		$proxyPort = Config::getVar('proxy', 'http_port');
+		$user = $this->getSetting($journalId, 'ithenticate_user');
+        $pass = $this->getSetting($journalId, 'ithenticate_pass');
+		$superUser = Config::getVar('ithenticate', 'username');
+		$superPass = Config::getVar('ithenticate', 'password');
+		if ((!isset($user)) || ($user == "")) {
+			$user = $superUser;
+			$pass = $superPass;
 		}
+		$pieces1 = explode('@', $user);
+		$pieces2 = explode('.', $pieces1[0]);
+		$firstName = ucfirst($pieces2[0]);
+		$lastName = ucfirst($pieces2[1]) ?? $firstName;
+		$contextName = $firstName.' '.$lastName;
+		
+		// Connect with superuser credentials to check if user $user is already defined
+		if ((isset($proxyName))&& (isset($proxyPort))) {
+			error_log("NewPlagiarism: We have proxy $proxyName:$proxyPort");
+			$ithenticate = new \joelfan\ithenticate\Ithenticate($superUser, $superPass, (object) array("proxyName" => $proxyName, "proxyPort" => $proxyPort ));			
+		}
+		else 
+			$ithenticate = new \joelfan\ithenticate\Ithenticate($superUser, $superPass);
 
-		$ithenticate = null;
-		try {
-			$ithenticate = new \bsobbe\ithenticate\Ithenticate($username, $password);
-		} catch (Exception $e) {
-			$this->sendErrorMessage($submission->getId(), $e->getMessage());
-			return false;
+		// get the list of users
+		$userList = $ithenticate->fetchUserList();
+		if (!($userId = array_search($user, $userList))) {
+			error_log("NewPlagiarism: Define user $user $firstName $lastName");
+			$userId = $ithenticate->addUser($user, $pass, $firstName, $lastName);
 		}
+		unset($ithenticate); // frees the object
+		
+		// Connect with normal user credentials
+		if ((isset($proxyName))&& (isset($proxyPort))) 
+			$ithenticate = new \joelfan\ithenticate\Ithenticate($user, $pass, (object) array("proxyName" => $proxyName, "proxyPort" => $proxyPort ));
+		else 
+			$ithenticate = new \joelfan\ithenticate\Ithenticate($user, $pass);
+
 		// Make sure there's a group list for this context, creating if necessary.
 		$groupList = $ithenticate->fetchGroupList();
 		$contextName = $context->getLocalizedName($context->getPrimaryLocale());
 		if (!($groupId = array_search($contextName, $groupList))) {
 			// No folder group found for the context; create one.
 			$groupId = $ithenticate->createGroup($contextName);
-			if (!$groupId) {
-				$this->sendErrorMessage($submission->getId(), 'Could not create folder group for context ' . $contextName . ' on iThenticate.');
+            if (!$groupId) {
+				error_log('Could not create folder group for context ' . $contextName . ' on iThenticate.');
 				return false;
 			}
 		}
@@ -147,62 +127,60 @@ class PlagiarismPlugin extends GenericPlugin {
 			'Submission_' . $submission->getId(),
 			'Submission_' . $submission->getId() . ': ' . $publication->getLocalizedTitle($publication->getData('locale')),
 			$groupId,
-			true,
-			true
+			1
 		))) {
-			$this->sendErrorMessage($submission->getId(), 'Could not create folder for submission ID ' . $submission->getId() . ' on iThenticate.');
+			error_log('Could not create folder for submission ID ' . $submission->getId() . ' on iThenticate.');
 			return false;
 		}
 
-		$submissionFiles = Services::get('submissionFile')->getMany([
-			'submissionIds' => [$submission->getId()],
-		]);
-
+		$submissionFileDao = DAORegistry::getDAO('SubmissionFileDAO');
+		$submissionFiles = $submissionFileDao->getBySubmissionId($submission->getId());
 		$authors = $publication->getData('authors');
 		$author = array_shift($authors);
 		foreach ($submissionFiles as $submissionFile) {
-			$file = Services::get('file')->get($submissionFile->getData('fileId'));
 			if (!$ithenticate->submitDocument(
-				$submissionFile->getLocalizedData('name'),
+				$submissionFile->getLocalizedName(),
 				$author->getLocalizedGivenName(),
 				$author->getLocalizedFamilyName(),
-				$submissionFile->getLocalizedData('name'),
-				Services::get('file')->fs->read($file->path),
+				$submissionFile->getOriginalFileName(),
+				file_get_contents($submissionFile->getFilePath()),
 				$folderId
 			)) {
-				$this->sendErrorMessage($submission->getId(), 'Could not submit "' . $submissionFile->getData('path') . '" to iThenticate.');
+				error_log('Could not submit ' . $submissionFile->getFilePath() . ' to iThenticate.');
 			}
 		}
 
 		return false;
 	}
 	
+	/*********** DB *******************/
 	/**
      * @copydoc Plugin::getActions()
      */
-    function getActions($request, $verb) {
+    public function getActions($request, $verb) {
         $router = $request->getRouter();
         import('lib.pkp.classes.linkAction.request.AjaxModal');
+		
         return array_merge(
-                $this->getEnabled() ? array(
-            new LinkAction(
-                    'settings',
-                    new AjaxModal(
-                            $router->url($request, null, null, 'manage', null, array('verb' => 'settings', 'plugin' => $this->getName(), 'category' => 'generic')),
-                            $this->getDisplayName()
-                    ),
-                    __('manager.plugins.settings'),
-                    null
-            ),
-                ) : array(),
-                parent::getActions($request, $verb)
+            $this->getEnabled() ? array(
+				new LinkAction(
+					'settings',
+					new AjaxModal(
+							$router->url($request, null, null, 'manage', null, array('verb' => 'settings', 'plugin' => $this->getName(), 'category' => 'generic')),
+							$this->getDisplayName()
+					),
+				__('manager.plugins.settings'),
+				null
+				),
+            ) : array(),
+            parent::getActions($request, $verb) 
         );
     }
 
     /**
      * @copydoc Plugin::manage()
      */
-    function manage($args, $request) {
+    public function manage($args, $request) {
         switch ($request->getUserVar('verb')) {
             case 'settings':
                 $context = $request->getContext();
@@ -225,7 +203,7 @@ class PlagiarismPlugin extends GenericPlugin {
                 }
                 return new JSONMessage(true, $form->fetch($request));
         }
-        return parent::manage($args, $request);
+        return parent::manage($args, $request);  
     }
 }
 
